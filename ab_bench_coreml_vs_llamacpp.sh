@@ -3,15 +3,10 @@ set -euo pipefail
 
 # USAGE:
 #   ./ab_bench_coreml_vs_llamacpp.sh \
-#     --hf-model Qwen/Qwen3-14B \
-#     --gguf-url https://huggingface.co/unsloth/Qwen3-14B-GGUF/resolve/main/Qwen3-14B-Q4_K_M.gguf \
-#     [--prompts-file my_prompts.txt]
-#
-#   ./ab_bench_coreml_vs_llamacpp.sh \
 #     --hf-model microsoft/phi-4 \
-#     --gguf-url https://huggingface.co/unsloth/phi-4-GGUF/resolve/main/phi-4-Q4_K_M.gguf
+#     --gguf-url https://huggingface.co/unsloth/phi-4-GGUF/resolve/main/phi-4-Q4_K_M.gguf \
+#     [--prompts-file my_prompts.txt]
 
-# -------- parse args --------
 HF_MODEL=""
 GGUF_URL=""
 PROMPTS_FILE=""
@@ -29,24 +24,23 @@ if [[ -z "$HF_MODEL" || -z "$GGUF_URL" ]]; then
   exit 1
 fi
 
-# -------- deps --------
 echo "[deps] Ensuring Xcode tools and Homebrew build deps..."
 xcode-select --install >/dev/null 2>&1 || true
 brew install cmake >/dev/null 2>&1 || true
 
 WORKDIR="$(mktemp -d -t abbench-XXXXXXXX)"
 echo "[workdir] $WORKDIR"
-
 pushd "$WORKDIR" >/dev/null
 
 echo "[venv] Creating ephemeral virtualenv..."
-python3 -m venv .venv
+/usr/bin/env python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -U pip setuptools wheel
+VENV_PY="$(/usr/bin/env python3 -c 'import sys,os; print(sys.executable)')"
+python3 -m pip install -U pip setuptools wheel
 
 echo "[pip] Installing Python deps..."
-python -m pip install \
-  "coremltools" \
+python3 -m pip install \
+  coremltools \
   "huggingface_hub>=0.23" \
   "requests>=2.31" \
   "psutil>=5.9.8" \
@@ -59,11 +53,11 @@ echo "[export] Exporting Core ML package for: $HF_MODEL"
 OUT_DIR="$WORKDIR/coreml_out"
 mkdir -p "$OUT_DIR"
 
-python - <<PY
-import sys, subprocess, os
-model = os.environ["HF_MODEL"]
-out   = os.environ["OUT_DIR"]
-# Use 'causal-lm-with-past' for autoregressive decoding
+# Pass args to Python (no env reliance, no pyenv)
+python3 - "$HF_MODEL" "$OUT_DIR" <<'PY'
+import sys, subprocess
+model = sys.argv[1]
+out   = sys.argv[2]
 cmd = [sys.executable, "-m", "exporters.coreml",
        "--model", model,
        "--feature", "causal-lm-with-past",
@@ -73,7 +67,7 @@ print("[export] Running:", " ".join(cmd))
 subprocess.check_call(cmd)
 PY
 
-MLPKG="$(ls -d "$OUT_DIR"/*.mlpackage "$OUT_DIR"/*.mlmodel 2>/dev/null | head -n 1 || true)"
+MLPKG=$(ls -d "$OUT_DIR"/*.mlpackage "$OUT_DIR"/*.mlmodel 2>/dev/null | head -n 1 || true)
 if [[ -z "$MLPKG" ]]; then
   echo "[export] ERROR: No Core ML package produced."
   exit 1
@@ -84,22 +78,15 @@ echo "[export] Core ML model: $MLPKG"
 echo "[server-coreml] Cloning Swift server..."
 git clone --depth 1 https://github.com/gety-ai/apple-on-device-openai.git server_coreml >/dev/null
 
-# The server expects a model path; many forks read MODEL_MLPACKAGE env or a CLI flag.
-# We pass MODEL_MLPACKAGE and default to port 8000.
 export MODEL_MLPACKAGE="$MLPKG"
 export COREML_PORT=8000
 
-echo "[server-coreml] Building & running (Release)..."
+echo "[server-coreml] Building & running (Release preferred)…"
 pushd server_coreml >/dev/null
-# Try release build; fall back to debug if toolchain is missing Release config
 ( swift build -c release >/dev/null 2>&1 || swift build >/dev/null 2>&1 )
-
-# Run in background
 ( swift run -c release || swift run ) >/dev/null 2>&1 &
 COREML_PID=$!
 popd >/dev/null
-
-# Give it a few seconds to boot
 sleep 5
 echo "[server-coreml] PID: $COREML_PID (http://127.0.0.1:8000/v1)"
 
@@ -110,7 +97,7 @@ pushd llama.cpp >/dev/null
 make -j >/dev/null
 popd >/dev/null
 
-echo "[server-llama] Downloading GGUF..."
+echo "[server-llama] Downloading GGUF…"
 GGUF_FILE="$WORKDIR/model.gguf"
 curl -L "$GGUF_URL" -o "$GGUF_FILE"
 
@@ -118,7 +105,6 @@ LLAMA_PORT=8080
 echo "[server-llama] Starting server on :$LLAMA_PORT"
 ( "$WORKDIR/llama.cpp/server" -m "$GGUF_FILE" --port "$LLAMA_PORT" --host 127.0.0.1 -c 8192 -fa ) >/dev/null 2>&1 &
 LLAMA_PID=$!
-
 sleep 5
 echo "[server-llama] PID: $LLAMA_PID (http://127.0.0.1:8080/v1)"
 
@@ -168,7 +154,6 @@ def openai_stream(base, apikey, model, prompt, timeout=600):
             gen_tokens_est += max(len(delta.split()), 0)
     t1 = time.perf_counter()
 
-    # non-stream call to try to get exact token count
     payload2 = {"model": model, "messages":[{"role":"user","content":prompt}], "temperature":0.2, "stream":False}
     try:
         r2 = requests.post(url, headers=headers, json=payload2, timeout=timeout)
@@ -231,7 +216,6 @@ def main():
     from tabulate import tabulate
     print(tabulate(rows, headers="keys", tablefmt="github"))
 
-    # write CSV + MD
     import csv
     with open("benchmark_results.csv","w",newline="") as f:
         w=csv.DictWriter(f,fieldnames=list(rows[0].keys()))
@@ -246,12 +230,11 @@ if __name__=="__main__":
     main()
 PY
 
-# -------- 5) Run benchmark --------
 export COREML_MODEL_NAME="$(basename "$MLPKG")"
 export LLAMACPP_MODEL_NAME="local-gguf"
-if [[ -n "$PROMPTS_FILE" ]]; then export PROMPTS_FILE="$PROMPTS_FILE"; fi
+if [[ -n "${PROMPTS_FILE}" ]]; then export PROMPTS_FILE="$PROMPTS_FILE"; fi
 
-python bench_harness.py
+python3 bench_harness.py
 
 echo
 echo "Saved results:"
@@ -259,12 +242,10 @@ echo "- $WORKDIR/benchmark_results.csv"
 echo "- $WORKDIR/benchmark_results.md"
 echo
 
-# -------- cleanup --------
 echo "[cleanup] Stopping servers and removing temp files..."
 kill "$COREML_PID" >/dev/null 2>&1 || true
 kill "$LLAMA_PID"  >/dev/null 2>&1 || true
 deactivate || true
 popd >/dev/null
 rm -rf "$WORKDIR"
-
 echo "[done] A/B complete."
